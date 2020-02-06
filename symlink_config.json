@@ -12,7 +12,7 @@
         "unstable-py2": "unstable-py27",
         "unstable-py27": "2021.01.rc0-py27",
         "unstable-py3": "unstable-py36",
-        "unstable-py36": "2020.01.a1-py36"
+        "unstable-py36": "2021.01.rc0-py36"
     },
     "root_folder": "/prog/res/komodo",
     "root_links": [
