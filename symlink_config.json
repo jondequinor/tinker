@@ -1,30 +1,26 @@
 {
-    "root_folder": "/prog/res/komodo",
-    "root_links" : [
-      "bleeding-py2",
-      "bleeding",
-      "unstable-py2",
-      "unstable",
-      "testing-py2",
-      "stable-py2"      
-    ],
     "links": {
-  
-      "bleeding-py3"  : "bleeding-py36",
-      "bleeding-py2"  : "bleeding-py27",
-      "bleeding"      : "bleeding-py3",
-      
-      "unstable-py36" : "2020.01.a1-py36",
-      "unstable-py3"  : "unstable-py36",
-      "unstable-py27" : "2020.01.a2-py27",
-      "unstable-py2"  : "unstable-py27",
-      "unstable"      : "unstable-py3",
-      
-      "testing-py2.7" : "2019.12.00-py27",
-      "testing-py2"   : "testing-py2.7",
-        
-      "2019.12"       : "2019.12.00-py27",
-      "stable-py27"   : "2019.12",
-      "stable-py2"    : "stable-py27"
-    }
-  }
+        "2019.12": "2019.12.00-py27",
+        "bleeding": "bleeding-py3",
+        "bleeding-py2": "bleeding-py27",
+        "bleeding-py3": "bleeding-py36",
+        "stable-py2": "stable-py27",
+        "stable-py27": "2019.12",
+        "testing-py2": "testing-py2.7",
+        "testing-py2.7": "2019.12.00-py27",
+        "unstable": "unstable-py3",
+        "unstable-py2": "unstable-py27",
+        "unstable-py27": "2021.01.rc0-py27",
+        "unstable-py3": "unstable-py36",
+        "unstable-py36": "2020.01.a1-py36"
+    },
+    "root_folder": "/prog/res/komodo",
+    "root_links": [
+        "bleeding-py2",
+        "bleeding",
+        "unstable-py2",
+        "unstable",
+        "testing-py2",
+        "stable-py2"
+    ]
+}
