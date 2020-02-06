@@ -1,13 +1,13 @@
 {
     "links": {
-        "2019.12": "2019.12.00-py27",
+        "2019.12": "2019.12.01-py2.7",
         "bleeding": "bleeding-py3",
         "bleeding-py2": "bleeding-py27",
         "bleeding-py3": "bleeding-py36",
         "stable-py2": "stable-py27",
         "stable-py27": "2019.12",
         "testing-py2": "testing-py2.7",
-        "testing-py2.7": "2019.12.00-py27",
+        "testing-py2.7": "2019.12.01-py2.7",
         "unstable": "unstable-py3",
         "unstable-py2": "unstable-py27",
         "unstable-py27": "2021.01.rc0-py27",
