@@ -1,13 +1,23 @@
+import json
+from collections import deque
 from typing import Generator, Union
+
 import pytest
+
 from atrack.atrack import (
-    _Ensemble,
-    _StateChange,
     _FSM,
-    UNKNOWN,
-    _Transition,
+    FAILURE,
     RUNNING,
+    SUCCESS,
+    UNKNOWN,
     IllegalTransition,
+    _Encoder,
+    _Ensemble,
+    _Event,
+    _Realization,
+    _State,
+    _StateChange,
+    _Transition,
 )
 
 
@@ -24,101 +34,180 @@ def test_transition():
 
 def test_orphaned_illegal_transition():
     n: _FSM = _FSM("/", "0")
-    with pytest.raises(IllegalTransition) as e:
-        next(n.transition(RUNNING))
-    assert e.value.transition == _Transition(UNKNOWN, RUNNING)
-    assert e.value.node == n
+    e = next(n.transition(RUNNING))
+    assert e.transition == _Transition(UNKNOWN, RUNNING)
+    assert e.node == n
 
 
-def test_unhandled_illegal_transition_in_child():
-    class _parent(_FSM):
-        def child_transitioned(
-            self, child: "_FSM", transition: Union[_Transition, IllegalTransition]
-        ) -> Generator[_StateChange, None, None]:
-            raise transition
+def test_handled_illegal_transition():
+    tgf = """Ensemble /0
+    Realization /0/0
+    Step /0/0/0
+    Job /0/0/0/0
+    """
+    ens = _Ensemble.from_ert_trivial_graph_format(tgf)
 
-    p = _parent("/", "0")
-    n = _FSM(p.path, "0", p)
-    with pytest.raises(IllegalTransition) as e:
-        next(n.transition(RUNNING))
-    assert e.value.transition == _Transition(UNKNOWN, RUNNING)
-    assert e.value.node == n
+    # UNKNOWN -> SUCCESS is handled by the step
+    gen = ens.dispatch(_Event("/0/0/0/0", "JOB_SUCCESS"))
 
+    illegal_transition = next(gen)
 
-def test_handled_illegal_transition_in_child():
-    class _parent(_FSM):
-        def child_transitioned(
-            self, child: "_FSM", transition: Union[_Transition, IllegalTransition]
-        ) -> Generator[_StateChange, None, None]:
-            yield from ()
+    assert isinstance(illegal_transition, IllegalTransition)
+    assert illegal_transition.node == ens.children[0].children[0].children[0]
+    assert illegal_transition.transition.from_state == UNKNOWN
+    assert illegal_transition.transition.to_state == SUCCESS
 
-    p = _parent("/", "0")
-    n = _FSM(p.path, "0", p)
-    list(n.transition(RUNNING))
+    change = next(gen)
+    assert isinstance(change, _StateChange)
+    assert change.node == ens.children[0].children[0].children[0]
+    assert change.transition.from_state == UNKNOWN
+    assert change.transition.to_state == SUCCESS
 
+    # will cause a step to transition illegally
+    # TODO: maybe just handle this in the step
 
-def test_child_transition_propagation():
-    """Test that a transition in a child that triggers a transition in a
-    parent, produces multiple changes."""
+    illegal_transition = next(gen)
+    assert isinstance(illegal_transition, IllegalTransition)
+    assert illegal_transition.node == ens.children[0].children[0]
+    assert illegal_transition.transition.from_state == UNKNOWN
+    assert illegal_transition.transition.to_state == SUCCESS
 
-    class _parent(_FSM):
-        def child_transitioned(
-            self, child: "_FSM", transition: Union[_Transition, IllegalTransition]
-        ) -> Generator[_StateChange, None, None]:
-            yield from self.transition(RUNNING)
-
-    transition = _Transition(UNKNOWN, RUNNING)
-
-    p = _parent("/", "0")
-    p.add_transition(transition)
-
-    n: _FSM = _FSM(p.path, "0", p)
-    n.add_transition(transition)
-
-    changes = list(n.transition(RUNNING))
-    assert len(changes) == 2
-    assert sorted(changes)[0].src == "/0"
-    assert sorted(changes)[1].src == "/0/0"
+    with pytest.raises(StopIteration):
+        next(gen)
 
 
-def test_multiple_child_transitions():
-    """Test that multiple transitions in children trigger multiple
-    child_transitioned in the parent."""
-    i = 0
+def test_unhandled_illegal_transition():
+    tgf = """Ensemble /0
+    Realization /0/0
+    Step /0/0/0
+    Job /0/0/0/0
+    """
+    ens = _Ensemble.from_ert_trivial_graph_format(tgf)
 
-    class _parent(_FSM):
-        def child_transitioned(
-            self, child: "_FSM", transition: Union[_Transition, IllegalTransition]
-        ) -> Generator[_StateChange, None, None]:
-            nonlocal i
-            i += 1
-            yield from ()
+    # move job to RUNNING
+    deque(ens.dispatch(_Event("/0/0/0/0", "JOB_STARTED")), maxlen=0)
+    deque(ens.dispatch(_Event("/0/0/0/0", "JOB_SUCCESS")), maxlen=0)
 
-    transition = _Transition(UNKNOWN, RUNNING)
+    # SUCCESS -> FAILURE is not handled by anyone
+    gen = ens.dispatch(_Event("/0/0/0/0", "JOB_FAILURE"))
 
-    p = _parent("/", "0")
+    illegal_transition = next(gen)
+    assert isinstance(illegal_transition, IllegalTransition)
+    assert illegal_transition.node == ens.children[0].children[0].children[0]
+    assert illegal_transition.transition.from_state == SUCCESS
+    assert illegal_transition.transition.to_state == FAILURE
 
-    n_0: _FSM = _FSM(p.path, "0", p)
-    n_0.add_transition(transition)
-    n_1: _FSM = _FSM(p.path, "1", p)
-    n_1.add_transition(transition)
-
-    changes = list(n_0.transition(RUNNING)) + list(n_1.transition(RUNNING))
-    assert i == 2
-    assert len(changes) == 2
+    with pytest.raises(IllegalTransition):
+        next(gen)
 
 
-@pytest.mark.parametrize("tgf", [(
-    """Ensemble /0
+def test_cascading_changes():
+    # test that completion of job, completes step, …, completes ens
+    tgf = """Ensemble /0
+    Realization /0/0
+    Step /0/0/0
+    Job /0/0/0/0
+    """
+    ens = _Ensemble.from_ert_trivial_graph_format(tgf)
+    all_changes = list(ens.dispatch(_Event("/0/0/0/0", "JOB_STARTED")))
+    all_changes += list(ens.dispatch(_Event("/0/0/0/0", "JOB_SUCCESS")))
+    partial = json.dumps(
+        _StateChange.changeset_to_partial(all_changes),
+        sort_keys=True,
+        indent=4,
+        cls=_Encoder,
+    )
+    assert (
+        partial
+        == """{
+    "reals": {
+        "0": {
+            "status": "SUCCESS",
+            "steps": {
+                "0": {
+                    "jobs": {
+                        "0": {
+                            "status": "SUCCESS"
+                        }
+                    },
+                    "status": "SUCCESS"
+                }
+            }
+        }
+    },
+    "status": "SUCCESS"
+}"""
+    )
+
+
+@pytest.mark.parametrize(
+    "a,b,equal",
+    [
+        (_State("foo"), _State("bar"), False),
+        (_State("foo"), _State("foo"), True),
+        (_State("bar"), _State("foo"), False),
+        (_State("foo", {}), _State("foo", {}), True),
+        (_State("bar", {}), _State("foo", {}), False),
+        (_State("foo", {"a": 0}), _State("foo", {"a": 0}), True),
+        (_State("foo", {}), _State("foo", {"a": 0}), False),
+        (_State("foo", {"a": 0}), _State("foo", {}), False),
+    ],
+)
+def test_state_equality(a, b, equal):
+    assert (a == b) == equal
+
+
+def test_equal_states_yield_no_change():
+    tgf = """Ensemble /0
+    Realization /0/0
+    Step /0/0/0
+    """
+    ens = _Ensemble.from_ert_trivial_graph_format(tgf)
+    gen = ens.dispatch(_Event("/0", "ENS_STARTED"))
+    ens_running = next(gen)
+
+    assert ens_running.node == ens
+    assert ens_running.transition.from_state == UNKNOWN
+    assert ens_running.transition.to_state == RUNNING
+
+    with pytest.raises(StopIteration):
+        next(gen)
+
+    for change in ens.dispatch(_Event("/0/0/0", "STEP_STARTED")):
+        assert (
+            change.transition.from_state != change.transition.to_state
+        ), "transitioned to same state"
+
+
+def test_equal_states_but_with_data_changes_yields_change():
+    tgf = """Ensemble /0
+    Realization /0/0
+    Step /0/0/0
+    """
+    ens = _Ensemble.from_ert_trivial_graph_format(tgf)
+    list(ens.dispatch(_Event("/0/0/0", "STEP_STARTED")))
+
+    gen = ens.dispatch(_Event("/0", "ENS_STARTED", {"foo": "bar"}))
+    ens_running = next(gen)
+
+    assert ens_running.node == ens
+    assert ens_running.transition.from_state == RUNNING
+    assert ens_running.transition.to_state == RUNNING.with_data({"foo": "bar"})
+
+    with pytest.raises(StopIteration):
+        next(gen)
+
+
+@pytest.mark.parametrize(
+    "tgf",
+    [
+        (
+            """Ensemble /0
     Realization /0/0
     """
-)])
+        )
+    ],
+)
 def test_tgf(tgf):
     ens = _Ensemble.from_ert_trivial_graph_format(tgf)
-    print(ens.children)
-
-# @pytest.mark.parametrize("tree,event,expected_partial", [
-#     (, )
-# ])
-# def test_foo(tree, event, expected_partial):
-#     pass
+    assert isinstance(ens.children[0], _Realization)

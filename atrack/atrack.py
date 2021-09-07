@@ -1,8 +1,10 @@
 """Module for tracking the states of a tree of state machines.
 """
+from collections import deque
 import io
 import json
 import asyncio
+from types import SimpleNamespace
 from typing import Any, Dict, Generator, List, NamedTuple, Optional, Type, Union
 
 from json import JSONEncoder
@@ -28,7 +30,11 @@ class _State:
 
     def __eq__(self, other: object):
         if isinstance(other, _State):
-            return self.name == other.name
+            return self.name == other.name and (
+                # if either has data, compare it
+                (not other.data and not self.data)
+                or other.data == self.data
+            )
         return self == other
 
     def with_data(self, data: Optional[dict]) -> "_State":
@@ -44,7 +50,7 @@ class _State:
 UNKNOWN = _State("UNKNOWN")
 RUNNING = _State("RUNNING")
 SUCCESS = _State("SUCCESS")
-FAILED = _State("FAILED")
+FAILURE = _State("FAILURE")
 
 
 # _Event is to be replaced by a CloudEvent
@@ -65,6 +71,13 @@ class _Event:  # pylint: disable=too-few-public-methods
 class _Transition(NamedTuple):
     from_state: _State
     to_state: _State
+
+    def comparable_to(self, from_state: _State, to_state: _State) -> bool:
+        """Disregarding node, are the two transitions roughly comparable."""
+        return (
+            self.from_state.name == from_state.name
+            and self.to_state.name == to_state.name
+        )
 
     def __repr__(self) -> str:
         return f"Transition<{self.from_state} -> {self.to_state}>"
@@ -191,9 +204,16 @@ class _FSM:
     def transition(self, to_state: _State) -> Generator[_TransitionResult, None, None]:
         """Transition this node to a new state."""
         for trans in self._transitions:
-            if self.state == trans.from_state and trans.to_state == to_state:
+            if trans.comparable_to(self.state, to_state):
+
+                # these states are equal even considering data, thus no-op
+                if trans.from_state == to_state:
+                    break
+
                 self.state = to_state
-                yield _StateChange(transition=trans, node=self)
+                yield _StateChange(
+                    transition=_Transition(trans.from_state, to_state), node=self
+                )
                 break
         else:
             yield IllegalTransition(
@@ -203,6 +223,7 @@ class _FSM:
             )
 
     def add_transition(self, transition: _Transition) -> None:
+        """Add a transition."""
         self._transitions.append(transition)
 
     def is_applicable(self, obj: _TransitionTrigger) -> bool:
@@ -212,25 +233,36 @@ class _FSM:
     def _dispatch_event(
         self, event: _Event
     ) -> Generator[_TransitionResult, None, None]:
-        raise NotImplementedError(f"{self.__class__.__name__} cannot dispatch event")
+        if self.children:
+            for child in self.children:
+                yield from child.dispatch(event)
+        else:
+            yield from ()
 
     def _dispatch_state_change(
         self, state_change: _StateChange
     ) -> Generator[_TransitionResult, None, None]:
-        raise NotImplementedError(
-            f"{self.__class__.__name__} cannot dispatch state change"
-        )
+        if self.children:
+            for child in self.children:
+                yield from child.dispatch(state_change)
+        else:
+            yield from ()
 
     def _dispatch_illegal_transition(
         self, illegal_transition: IllegalTransition
     ) -> Generator[_TransitionResult, None, None]:
-        raise NotImplementedError(
-            f"{self.__class__.__name__} cannot dispatch illegal transition"
-        )
+        """Should not be called at all if the illegal_transition has been
+        handled."""
+        if self.children:
+            for child in self.children:
+                yield from child.dispatch(illegal_transition)
+        else:
+            raise illegal_transition
 
     def dispatch(
         self, obj: _TransitionTrigger
     ) -> Generator[_TransitionResult, None, None]:
+        """Dispatch something that triggers changes."""
         if not self.is_applicable(obj):
             return
         if isinstance(obj, _Event):
@@ -249,6 +281,8 @@ class _Job(_FSM):
         self.add_transition(_Transition(UNKNOWN, RUNNING))
         self.add_transition(_Transition(RUNNING, RUNNING))
         self.add_transition(_Transition(RUNNING, SUCCESS))
+        self.add_transition(_Transition(UNKNOWN, FAILURE))
+        self.add_transition(_Transition(RUNNING, FAILURE))
 
     def _dispatch_event(
         self, event: _Event
@@ -259,18 +293,10 @@ class _Job(_FSM):
             yield from self.transition(RUNNING.with_data(event.data))
         elif event.type_ == "JOB_SUCCESS":
             yield from self.transition(SUCCESS.with_data(event.data))
+        elif event.type_ == "JOB_FAILURE":
+            yield from self.transition(FAILURE.with_data(event.data))
 
-    def _dispatch_state_change(
-        self, state_change: _StateChange
-    ) -> Generator[_TransitionResult, None, None]:
-        yield from ()
-
-    def _dispatch_illegal_transition(
-        self, illegal_transition: IllegalTransition
-    ) -> Generator[_TransitionResult, None, None]:
-        # Job is the leaf. If the illegal transition hasn't been handled until
-        # now, and the job does not handle it, it is raised.
-        raise illegal_transition
+        yield from super()._dispatch_event(event)
 
 
 class _Step(_FSM):
@@ -290,14 +316,23 @@ class _Step(_FSM):
         elif event.type_ == "STEP_SUCCESS":
             yield from self.transition(SUCCESS.with_data(event.data))
 
-        for child in self._children:
-            yield from child.dispatch(event)
+        yield from super()._dispatch_event(event)
 
     def _dispatch_state_change(
         self, state_change: _StateChange
     ) -> Generator[_TransitionResult, None, None]:
-        for child in self.children:
-            yield from child.dispatch(state_change)
+        if state_change.node in self.children:
+            if state_change.transition.to_state == RUNNING:
+                yield from self.transition(RUNNING)
+            elif state_change.transition.to_state == SUCCESS:
+                # are all jobs succeeding?
+                for job in self._children:
+                    if job.state != SUCCESS:
+                        break
+                else:
+                    yield from self.transition(SUCCESS)
+
+        yield from super()._dispatch_state_change(state_change)
 
     def _dispatch_illegal_transition(
         self, illegal_transition: IllegalTransition
@@ -314,12 +349,11 @@ class _Step(_FSM):
                         node=self._children[i],
                     )
                     i -= 1
-            
+
                 # since it was handled here, stop propagating it downwards
                 return
 
-        for child in self.children:
-            yield from child.dispatch(illegal_transition)
+        yield from super()._dispatch_illegal_transition(illegal_transition)
 
 
 class _Realization(_FSM):
@@ -328,12 +362,6 @@ class _Realization(_FSM):
         self.add_transition(_Transition(UNKNOWN, RUNNING))
         self.add_transition(_Transition(RUNNING, RUNNING))
         self.add_transition(_Transition(RUNNING, SUCCESS))
-
-    def _dispatch_event(
-        self, event: _Event
-    ) -> Generator[_TransitionResult, None, None]:
-        for child in self._children:
-            yield from child.dispatch(event)
 
     def _dispatch_state_change(
         self, state_change: _StateChange
@@ -349,14 +377,7 @@ class _Realization(_FSM):
                 else:
                     yield from self.transition(SUCCESS)
 
-        for child in self.children:
-            yield from child.dispatch(state_change)
-
-    def _dispatch_illegal_transition(
-        self, illegal_transition: IllegalTransition
-    ) -> Generator[_TransitionResult, None, None]:
-        for child in self.children:
-            yield from child.dispatch(illegal_transition)
+        yield from super()._dispatch_state_change(state_change)
 
 
 class _Ensemble(_FSM):
@@ -402,14 +423,15 @@ class _Ensemble(_FSM):
         if event.type_ == "ENS_SUCCESS":
             yield from self.transition(SUCCESS.with_data(event.data))
 
-        for child in self.children:
-            yield from child.dispatch(event)
+        yield from super()._dispatch_event(event)
 
     def _dispatch_state_change(
         self, state_change: _StateChange
     ) -> Generator[_TransitionResult, None, None]:
         if state_change.node in self.children:
-            if state_change.transition.to_state == SUCCESS:
+            if state_change.transition.to_state == RUNNING:
+                yield from self.transition(RUNNING)
+            elif state_change.transition.to_state == SUCCESS:
                 # are all reals succeeding?
                 for real in self.children:
                     if real.state != SUCCESS:
@@ -417,39 +439,36 @@ class _Ensemble(_FSM):
                 else:
                     yield from self.transition(SUCCESS)
 
-        for child in self.children:
-            yield from child.dispatch(state_change)
+        yield from super()._dispatch_state_change(state_change)
 
-    def _dispatch_illegal_transition(
-        self, illegal_transition: IllegalTransition
+    def _recursive_dispatch(
+        self, change: _TransitionTrigger
     ) -> Generator[_TransitionResult, None, None]:
-        for child in self.children:
-            yield from child.dispatch(illegal_transition)
+        deck = deque([change])
+        max_iterations = 1000
+        iterations = 0
+        while len(deck):
+            iterations += 1
+            trigger = deck.pop()
+            changes = list(super().dispatch(trigger))
+            deck.extendleft(changes)
+            yield from changes
 
-    def _iterative_recursive_dispatch(self) -> Generator[_TransitionResult, _TransitionResult, None]:
-        change = None
-        while True:
-            change = yield change
-            for change in super().dispatch(change):
-                yield change
-            else:
-                change = None
+            if iterations > max_iterations:
+                raise RecursionError(f"{change} caused > {max_iterations} changes")
 
     def dispatch(
         self, obj: _TransitionTrigger
     ) -> Generator[_TransitionResult, None, None]:
+        """Dispatch something that triggers a change, but recurse over the tree
+        for all changes until there are no more."""
         if not self.is_applicable(obj):
             return
         if not isinstance(obj, _Event) and not isinstance(obj, IllegalTransition):
             raise TypeError(f"cannot dispatch {type(obj)}")
         for change in self._dispatch_event(obj):
-            gen = self._iterative_recursive_dispatch()
-            next(gen)
-            while change:
-                yield change
-                change = gen.send(change)
-                print("foo", change)
-
+            yield change
+            yield from self._recursive_dispatch(change)
 
     @staticmethod
     def from_ert_trivial_graph_format(tgf: str) -> "_Ensemble":
@@ -505,7 +524,6 @@ class _Ensemble(_FSM):
 
 
 async def main():
-    """Example"""
     ens = _Ensemble("0")
     real_1 = _Realization("r1", ens)
     real_2 = _Realization("r2", ens)
@@ -532,12 +550,14 @@ async def main():
         _Event("/0/r2/s2/j1", "JOB_SUCCESS"),
         _Event("/0/r2/s2/j2", "JOB_STARTED"),
         _Event("/0/r2/s2/j2", "JOB_SUCCESS"),
-        # _Event("/0/r2/s2/j2", "JOB_RUNNING"),
+        _Event("/0/r2/s2/j2", "JOB_RUNNING"),
         _Event("/0/r2/s2", "STEP_SUCCESS"),
         _Event("/0", "ENS_SUCCESS"),
     ]:
         changes: List[_StateChange] = []
         for change in ens.dispatch(evt):
+            if not isinstance(change, _StateChange):
+                continue
             changes.append(change)
         partial = _StateChange.changeset_to_partial(sorted(changes))
         print(evt, changes, partial)
